@@ -5,6 +5,14 @@
 - 应用层主动埋点：`Java / Python / TS` 风格应用通过 `OTel SDK -> OTel Collector -> vmagent -> VictoriaMetrics`
 - 平台与系统指标采集：`node_exporter` 等被动采集指标通过 `vmagent -> VictoriaMetrics`
 - 日志采集与查询：应用文件日志通过 `Vector -> VictoriaLogs -> Grafana`
+- 指标存储备份：`VictoriaMetrics -> vmbackup -> MinIO(S3)`
+
+当前仓库实际提供两个应用示例：
+
+- `demo-python`
+- `demo-ts`
+
+这里没有单独实现一个 Java demo 服务，但应用层主动埋点链路本身就是按 `Java / Python / TS` 这类 OTel SDK 场景设计的。
 
 同时，这个 demo 还模拟了一个跨区域传输场景：
 
@@ -13,12 +21,14 @@
 - `vmagent` 不做聚合，按 `2s` flush 一次
 - 主链路强制使用 `VictoriaMetrics remote write` 协议
 - 旁路保留一条 `Prometheus remote write` 对照链路，用于估算带宽占用与协议压缩收益
+- `VictoriaMetrics` 主库按固定间隔创建快照，并自动备份到 `MinIO` 的 S3 接口
 
-这个仓库适合做三件事：
+这个仓库适合做四件事：
 
 - 演示一套最小可用的 `metrics + logs + dashboard` 方案
 - 验证 `vmagent -> VictoriaMetrics` 直写是否能满足跨区域汇聚场景
 - 量化 `VM remote write` 相对 `Prom remote write` 的带宽与压缩差异
+- 验证 `VictoriaMetrics -> MinIO` 的自动备份链路是否可用
 
 ## 快速开始
 
@@ -50,16 +60,26 @@ docker compose ps
 docker compose down
 ```
 
+查看 MinIO 中的备份对象：
+
+```bash
+cd /home/lyk/code/observability-platform-demo
+./list-vm-backups.sh
+```
+
 ## 演示链路
 
 - 应用业务 metrics：`demo-python + demo-ts -> OTel Collector -> vmagent -> VictoriaMetrics`
 - 高频进程 metrics：`demo-python:/metrics + demo-ts:/metrics -> vmagent(10Hz) -> VictoriaMetrics`
 - 低频系统 metrics：`node-exporter -> vmagent(1Hz) -> VictoriaMetrics`
 - 传输对照：`vmagent -> VictoriaMetrics(primary, VM 协议)` 与 `vmagent -> VictoriaMetrics benchmark(Prom 协议)`
+- 自动备份：`VictoriaMetrics(snapshot) -> vmbackup -> MinIO(S3 bucket: vm-backups/latest)`
 - logs：`demo-python.log + demo-ts.log -> Vector -> VictoriaLogs`
 - 展示：`Grafana -> VictoriaMetrics + VictoriaLogs`
 
 接收侧没有再加一个 `vmagent`。这个 demo 直接把 `vmagent` 写入 `VictoriaMetrics`，更符合“源端汇聚，目标端直接入库”的最小实现。
+
+`MinIO` 在这个仓库里只承担对象存储备份目标的角色，不是 `VictoriaMetrics` 的在线主存储。主库存储仍然是本地 volume，备份链路通过 `snapshot + vmbackup` 异步写到 S3 兼容接口。
 
 ## 组件说明
 
@@ -70,6 +90,9 @@ docker compose down
 - `vmagent`：统一抓取 OTel、系统、进程、自监控与主库自监控；`2s` flush；主链路强制 `VM remote write`，旁路对照强制 `Prom remote write`。
 - `victoria-metrics`：主库存储，用于展示最终 TSDB 资源占用与压缩率。
 - `victoria-metrics-benchmark`：只用于传输协议对照，不接入 Grafana。
+- `minio`：S3 兼容对象存储，用于承接 `VictoriaMetrics` 备份对象。
+- `minio-init`：一次性初始化容器，负责等待 `MinIO` 就绪并创建 `vm-backups` bucket。
+- `vmbackup`：共享主库数据卷，调用 `VictoriaMetrics` 快照接口并周期性把备份增量上传到 `MinIO`。
 - `vector`：读取共享 volume 中的双应用日志文件，做 JSON 解析和过滤后写入 `VictoriaLogs`。
 - `grafana`：预置数据源和 `Cross-Region Transport & Storage` dashboard。
 
@@ -86,8 +109,11 @@ docker compose down
 ├── docker/
 │   ├── demo-app/                # Python 应用镜像
 │   ├── demo-ts/                 # TS 应用镜像
-│   └── grafana/                 # Grafana 自定义镜像与插件下载脚本
+│   ├── grafana/                 # Grafana 自定义镜像与插件下载脚本
+│   ├── minio/                   # MinIO bucket 初始化脚本
+│   └── vmbackup/                # VictoriaMetrics 自动备份脚本
 ├── docker-compose.yml           # 整体编排
+├── list-vm-backups.sh           # 查看 MinIO 中的备份对象
 ├── verify.sh                    # 基础链路验收脚本
 └── report-cross-region.sh       # 跨区域传输与存储报告脚本
 ```
@@ -137,6 +163,14 @@ docker compose up -d --force-recreate grafana
 ./verify.sh
 ```
 
+常用备份观察命令：
+
+```bash
+docker compose logs -f vmbackup
+./list-vm-backups.sh
+./list-vm-backups.sh latest
+```
+
 输出跨区域传输与存储报告：
 
 ```bash
@@ -149,11 +183,23 @@ docker compose up -d --force-recreate grafana
 ./report-cross-region.sh 60
 ```
 
+## 自动备份说明
+
+这条备份链路的行为是固定且可复现的：
+
+- `minio-init` 只在启动阶段运行一次，负责创建 `vm-backups` bucket。
+- `vmbackup` 容器启动后会立刻执行一次备份，此后按 `60s` 周期循环执行。
+- 备份前会调用 `VictoriaMetrics` 的 `snapshot/create` 接口生成瞬时快照，再把快照内容上传到 `s3://vm-backups/latest`。
+- 备份目标使用 `latest` 前缀，新的备份会替换掉这个前缀下不再需要的旧对象，不是在 bucket 里无限堆历史目录。
+- 这个仓库只演示自动备份链路，没有把 `vmrestore` 的恢复流程接进 `docker compose`。
+
 ## 访问入口
 
 - Demo Python: `http://localhost:8080`
 - Demo TS: `http://localhost:8081`
 - Grafana: `http://localhost:3000`
+- MinIO S3 API: `http://localhost:9000`
+- MinIO Console: `http://localhost:9001`
 - VictoriaMetrics 主库: `http://localhost:8428`
 - VictoriaMetrics benchmark: `http://localhost:8427`
 - VictoriaLogs: `http://localhost:9428`
@@ -162,6 +208,19 @@ Grafana 默认账号密码：
 
 - 用户名：`admin`
 - 密码：`admin`
+
+MinIO 默认账号密码：
+
+- 用户名：`minioadmin`
+- 密码：`minioadmin`
+
+自动备份默认配置：
+
+- bucket：`vm-backups`
+- 备份前缀：`latest`
+- 备份周期：`60s`
+- 备份方式：`VictoriaMetrics` 快照 + `vmbackup` 增量上传
+- 首次执行时机：`vmbackup` 容器启动后立即执行一次
 
 Grafana 预置 dashboard：
 
@@ -184,6 +243,12 @@ Grafana 预置 dashboard：
 - 高频样本速率来自 `vmagent_remotewrite_rows_pushed_after_relabel_total`
 - 主库资源来自 `process_*` 与 `vm_data_size_bytes`
 - 存储压缩率来自 `vm_zstd_block_original_bytes_total / vm_zstd_block_compressed_bytes_total`
+
+自动备份链路不在 `report-cross-region.sh` 的统计范围内。备份是否成功由下面三种方式观察：
+
+- `./verify.sh`
+- `docker compose logs -f vmbackup`
+- `./list-vm-backups.sh`
 
 说明：
 
@@ -220,6 +285,19 @@ curl -s "http://localhost:9428/select/logsql/query?query=service:demo-python%20|
 curl -s "http://localhost:9428/select/logsql/query?query=service:demo-ts%20|%20limit%205"
 ```
 
+MinIO 备份对象：
+
+```bash
+./list-vm-backups.sh
+./list-vm-backups.sh latest
+```
+
+备份执行日志：
+
+```bash
+docker compose logs --tail=50 vmbackup
+```
+
 Grafana：
 
 ```bash
@@ -239,4 +317,5 @@ curl -s -u admin:admin "http://localhost:3000/api/dashboards/uid/cross-region-tr
 - 保留现有 OTel + Vector 基础链路，不把进程级高频采集混到 OTel 里。
 - 高频进程指标直接由 `vmagent` 抓取应用 `/metrics`，避免额外引入接收侧 `vmagent`。
 - 为了可量化展示 VM 协议带宽收益，额外保留一条 Prom 协议 benchmark 落点；主链路仍然只使用 VM 协议。
+- 备份链路使用开源 `vmbackup` + `MinIO`，不引入需要额外许可的 `vmbackupmanager`。
 - 只做 `1Hz` 系统指标和 `10Hz` 进程指标两档频率，不扩展更多频率层级。

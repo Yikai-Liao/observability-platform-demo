@@ -2,8 +2,10 @@
 
 set -euo pipefail
 
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly PYTHON_URL="http://localhost:8080"
 readonly TS_URL="http://localhost:8081"
+readonly MINIO_URL="http://localhost:9000"
 readonly VM_URL="http://localhost:8428"
 readonly VM_BENCHMARK_URL="http://localhost:8427"
 readonly VLOGS_URL="http://localhost:9428"
@@ -85,9 +87,34 @@ wait_for_query_contains_text() {
   done
 }
 
-echo "[1/6] 等待基础服务就绪"
+wait_for_backup_object() {
+  local name="$1"
+  local expected="$2"
+  local max_attempts="${3:-30}"
+  local attempt=1
+  local response
+
+  while true; do
+    response="$("${SCRIPT_DIR}/list-vm-backups.sh" 2>/dev/null || true)"
+    if [[ "$response" == *"$expected"* ]]; then
+      return 0
+    fi
+
+    if [[ "$attempt" -ge "$max_attempts" ]]; then
+      echo "${name} 未命中预期文本: ${expected}" >&2
+      echo "$response" >&2
+      exit 1
+    fi
+
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+}
+
+echo "[1/7] 等待基础服务就绪"
 wait_for_http "demo-python" "${PYTHON_URL}/healthz"
 wait_for_http "demo-ts" "${TS_URL}/healthz"
+wait_for_http "MinIO" "${MINIO_URL}/minio/health/live"
 wait_for_http "VictoriaMetrics" "${VM_URL}/health"
 wait_for_http "VictoriaMetrics benchmark" "${VM_BENCHMARK_URL}/health"
 wait_for_http "VictoriaLogs" "${VLOGS_URL}/health"
@@ -95,16 +122,16 @@ wait_for_http "Grafana" "${GRAFANA_URL}/api/health"
 wait_for_http "demo-python metrics" "${PYTHON_URL}/metrics"
 wait_for_http "demo-ts metrics" "${TS_URL}/metrics"
 
-echo "[2/6] 生成演示流量"
+echo "[2/7] 生成演示流量"
 for i in $(seq 1 5); do
   curl -fsS "${PYTHON_URL}/work/python-${i}" >/dev/null
   curl -fsS "${TS_URL}/work/ts-${i}" >/dev/null
 done
 
-echo "[3/6] 等待采集链路写入"
+echo "[3/7] 等待采集链路写入"
 sleep 6
 
-echo "[4/6] 校验 metrics"
+echo "[4/7] 校验 metrics"
 wait_for_query_result \
   "应用 metrics" \
   "${VM_URL}/api/v1/query?query=sum%20by%20(service)(demo_requests_total)"
@@ -132,7 +159,7 @@ wait_for_query_result \
   "主库存储 metrics" \
   "${VM_URL}/api/v1/query?query=process_resident_memory_bytes%7Bjob%3D%22storage-primary%22%7D"
 
-echo "[5/6] 校验 logs 与 Grafana 数据源"
+echo "[5/7] 校验 logs 与 Grafana 数据源"
 wait_for_query_contains_text \
   "Python logs" \
   "${VLOGS_URL}/select/logsql/query?query=service:demo-python%20|%20limit%205" \
@@ -150,10 +177,15 @@ wait_for_query_contains_text \
   "http://admin:admin@localhost:3000/api/datasources/name/VictoriaLogs" \
   "VictoriaLogs"
 
-echo "[6/6] 校验 Grafana dashboard"
+echo "[6/7] 校验 MinIO 自动备份"
+wait_for_backup_object \
+  "MinIO 备份对象" \
+  "latest/"
+
+echo "[7/7] 校验 Grafana dashboard"
 wait_for_query_contains_text \
   "Grafana cross-region dashboard" \
   "http://admin:admin@localhost:3000/api/dashboards/uid/cross-region-transport" \
   "\"uid\":\"cross-region-transport\""
 
-echo "验证通过：高频 process metrics、低频 remote write、logs、Grafana dashboard 全部可用"
+echo "验证通过：高频 process metrics、低频 remote write、logs、Grafana dashboard、MinIO 自动备份 全部可用"

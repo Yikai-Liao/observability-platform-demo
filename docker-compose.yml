@@ -15,6 +15,39 @@ x-proxy-env: &proxy_env
   no_proxy: ${NO_PROXY:-}
 
 services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --address ":9000" --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    entrypoint: ["/bin/sh", "/etc/minio/init-minio.sh"]
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_REGION: us-east-1
+      MINIO_BACKUP_BUCKET: vm-backups
+    volumes:
+      - ./docker/minio/init-minio.sh:/etc/minio/init-minio.sh:ro
+    depends_on:
+      minio:
+        condition: service_started
+    networks:
+      - observability
+    restart: "no"
+
   demo-python:
     build:
       context: .
@@ -119,6 +152,33 @@ services:
       - observability
     restart: unless-stopped
 
+  vmbackup:
+    image: victoriametrics/vmbackup:v1.112.0
+    entrypoint: ["/bin/sh", "/etc/vmbackup/backup-loop.sh"]
+    environment:
+      VM_STORAGE_DATA_PATH: /victoria-metrics-data
+      VM_SNAPSHOT_URL: http://victoria-metrics:8428/snapshot/create
+      VM_BACKUP_DST: s3://vm-backups/latest
+      VM_BACKUP_INTERVAL_SECONDS: "60"
+      VM_BACKUP_CONCURRENCY: "4"
+      VM_BACKUP_S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    volumes:
+      - vm_data:/victoria-metrics-data:ro
+      - ./docker/vmbackup/backup-loop.sh:/etc/vmbackup/backup-loop.sh:ro
+    depends_on:
+      victoria-metrics:
+        condition: service_started
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - observability
+    restart: unless-stopped
+
   victoria-metrics-benchmark:
     image: victoriametrics/victoria-metrics:v1.112.0
     command:
@@ -185,6 +245,7 @@ networks:
 
 volumes:
   demo_logs:
+  minio_data:
   vmagent_data:
   vm_data:
   vm_benchmark_data:
