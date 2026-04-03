@@ -1,0 +1,192 @@
+x-proxy-build-args: &proxy-build_args
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  ALL_PROXY: ${ALL_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+
+x-proxy-env: &proxy_env
+  HTTP_PROXY: ${HTTP_PROXY:-}
+  HTTPS_PROXY: ${HTTPS_PROXY:-}
+  ALL_PROXY: ${ALL_PROXY:-}
+  NO_PROXY: ${NO_PROXY:-}
+  http_proxy: ${HTTP_PROXY:-}
+  https_proxy: ${HTTPS_PROXY:-}
+  all_proxy: ${ALL_PROXY:-}
+  no_proxy: ${NO_PROXY:-}
+
+services:
+  demo-python:
+    build:
+      context: .
+      dockerfile: docker/demo-app/Dockerfile
+      args: *proxy-build_args
+    environment:
+      <<: *proxy_env
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/metrics
+      OTEL_SERVICE_NAME: demo-python
+      DEMO_LOG_FILE: /var/log/demo/demo-python.log
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
+    depends_on:
+      - otel-collector
+    ports:
+      - "8080:8080"
+    volumes:
+      - demo_logs:/var/log/demo
+    networks:
+      - observability
+
+  demo-ts:
+    build:
+      context: .
+      dockerfile: docker/demo-ts/Dockerfile
+      args: *proxy-build_args
+    environment:
+      <<: *proxy_env
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/metrics
+      OTEL_SERVICE_NAME: demo-ts
+      DEMO_LOG_FILE: /var/log/demo/demo-ts.log
+      NODE_ENV: production
+    restart: unless-stopped
+    depends_on:
+      - otel-collector
+    ports:
+      - "8081:8080"
+    volumes:
+      - demo_logs:/var/log/demo
+    networks:
+      - observability
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.122.1
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./config/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"
+      - "8889:8889"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command:
+      - --path.rootfs=/host
+    pid: host
+    restart: unless-stopped
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - observability
+
+  vmagent:
+    image: victoriametrics/vmagent:v1.112.0
+    command:
+      - --promscrape.config=/etc/vmagent/prometheus.yml
+      - --remoteWrite.url=http://victoria-metrics:8428/api/v1/write
+      - --remoteWrite.url=http://victoria-metrics-benchmark:8428/api/v1/write
+      - --remoteWrite.forceVMProto=true,false
+      - --remoteWrite.forcePromProto=false,true
+      - --remoteWrite.flushInterval=2s
+      - --remoteWrite.tmpDataPath=/vmagent-remotewrite-data
+    volumes:
+      - ./config/vmagent/prometheus.yml:/etc/vmagent/prometheus.yml:ro
+      - vmagent_data:/vmagent-remotewrite-data
+    depends_on:
+      - victoria-metrics
+      - victoria-metrics-benchmark
+      - otel-collector
+      - node-exporter
+      - demo-python
+      - demo-ts
+    ports:
+      - "8429:8429"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  victoria-metrics:
+    image: victoriametrics/victoria-metrics:v1.112.0
+    command:
+      - --storageDataPath=/victoria-metrics-data
+      - --httpListenAddr=:8428
+    volumes:
+      - vm_data:/victoria-metrics-data
+    ports:
+      - "8428:8428"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  victoria-metrics-benchmark:
+    image: victoriametrics/victoria-metrics:v1.112.0
+    command:
+      - --storageDataPath=/victoria-metrics-data
+      - --httpListenAddr=:8428
+    volumes:
+      - vm_benchmark_data:/victoria-metrics-data
+    ports:
+      - "8427:8428"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  victoria-logs:
+    image: victoriametrics/victoria-logs:v1.18.0-victorialogs
+    command:
+      - --storageDataPath=/victoria-logs-data
+      - --httpListenAddr=:9428
+    volumes:
+      - vlogs_data:/victoria-logs-data
+    ports:
+      - "9428:9428"
+    networks:
+      - observability
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:0.41.1-debian
+    command: ["--config", "/etc/vector/vector.yaml"]
+    depends_on:
+      - victoria-logs
+    volumes:
+      - ./config/vector/vector.yaml:/etc/vector/vector.yaml:ro
+      - demo_logs:/var/log/demo:ro
+    networks:
+      - observability
+    restart: unless-stopped
+
+  grafana:
+    build:
+      context: .
+      dockerfile: docker/grafana/Dockerfile
+    environment:
+      <<: *proxy_env
+      GF_PATHS_PLUGINS: /opt/grafana-plugins
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - victoria-metrics
+      - victoria-logs
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - observability
+    restart: unless-stopped
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  demo_logs:
+  vmagent_data:
+  vm_data:
+  vm_benchmark_data:
+  vlogs_data:
+  grafana_data:

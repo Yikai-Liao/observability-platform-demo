@@ -1,0 +1,44 @@
+data_dir: /var/lib/vector
+
+sources:
+  demo_app_logs:
+    type: file
+    include:
+      - /var/log/demo/*.log
+    read_from: beginning
+
+transforms:
+  parse_demo_logs:
+    type: remap
+    inputs:
+      - demo_app_logs
+    source: |
+      . = parse_json!(string!(.message))
+
+  only_demo_services:
+    type: filter
+    inputs:
+      - parse_demo_logs
+    condition: |
+      .service != null && (string!(.service) == "demo-python" || string!(.service) == "demo-ts")
+
+  normalize_demo_logs:
+    type: remap
+    inputs:
+      - only_demo_services
+    source: |
+      .source_type = "file"
+      .message = string!(.message)
+      ._msg = .message
+
+sinks:
+  victoria_logs:
+    type: elasticsearch
+    inputs:
+      - normalize_demo_logs
+    endpoints:
+      - http://victoria-logs:9428/insert/elasticsearch
+    mode: bulk
+    api_version: v8
+    compression: gzip
+    healthcheck: false

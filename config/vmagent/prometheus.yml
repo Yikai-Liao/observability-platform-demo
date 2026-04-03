@@ -1,0 +1,66 @@
+global:
+  scrape_interval: 1s
+  scrape_timeout: 900ms
+
+scrape_configs:
+  - job_name: otel-collector
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["otel-collector:8889"]
+        labels:
+          metric_scope: application
+          region: edge-a
+
+  - job_name: system-node
+    scrape_interval: 1s
+    static_configs:
+      - targets: ["node-exporter:9100"]
+        labels:
+          metric_scope: system
+          region: edge-a
+
+  - job_name: process-python
+    scrape_interval: 100ms
+    scrape_timeout: 90ms
+    static_configs:
+      - targets: ["demo-python:8080"]
+        labels:
+          metric_scope: process
+          region: edge-a
+          service: demo-python
+
+  - job_name: process-ts
+    scrape_interval: 100ms
+    scrape_timeout: 90ms
+    static_configs:
+      - targets: ["demo-ts:8080"]
+        labels:
+          metric_scope: process
+          region: edge-a
+          service: demo-ts
+
+  - job_name: transport-vmagent
+    scrape_interval: 1s
+    static_configs:
+      - targets: ["vmagent:8429"]
+        labels:
+          metric_scope: transport
+          region: edge-a
+
+  - job_name: storage-primary
+    scrape_interval: 1s
+    static_configs:
+      - targets: ["victoria-metrics:8428"]
+        labels:
+          metric_scope: storage
+          region: core-b
+          storage_role: primary
+
+  - job_name: storage-benchmark
+    scrape_interval: 5s
+    static_configs:
+      - targets: ["victoria-metrics-benchmark:8428"]
+        labels:
+          metric_scope: storage
+          region: core-b
+          storage_role: benchmark
